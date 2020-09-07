@@ -1,0 +1,13 @@
+[Unit]
+Description=OLED Backlight Service
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/oledbacklight
+Restart=on-failure
+StandardOutput=syslog+console
+StandardError=syslog+console
+
+[Install]
+WantedBy=multi-user.target

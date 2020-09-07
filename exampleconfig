@@ -1,0 +1,4 @@
+display=[eDP-1-1, DP-2]
+path=/sys/class/backlight/intel_backlight
+xrandr-display=:1
+xrandr-xauthority-path=/run/user/1000/gdm/Xauthority

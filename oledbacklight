@@ -1,0 +1,136 @@
+#!/usr/bin/python3
+
+# Updated 2020 by @gadgetoid to use inotify
+# You'll need these dependencies:
+#  * sudo apt-get install python3-pip libxcb-render0-dev libffi-dev
+#  * sudo pip3 install xcffib inotify configargparse
+#
+# Breaks horribly in conjunction with Night Light
+#
+# based on:
+# https://gist.github.com/indivisible/f643d970bbe362ab1d5cf7c4e604c984
+#
+# which is, in turn, based on:
+# https://gist.github.com/joel-wright/68fc3031cbb3f7cd25db1ed2fe656e60
+
+import os
+import time
+from functools import lru_cache
+from pathlib import Path
+
+import configargparse
+import inotify.adapters
+import inotify.constants
+import xcffib
+import xcffib.randr
+
+UINT16_MAX = 2**16 - 1
+
+DEFAULT_PATH = "/sys/class/backlight/intel_backlight"
+
+XRANDR_XAUTHORITY_PATH = "/run/user/1000/gdm/Xauthority"
+XRANDR_DISPLAY = ":1"
+
+
+# this has the happy consequence of resetting gamma
+class BrightnessSetter():
+    def __init__(self, output_names=[], display_name=None, screen_num=None):
+        self.connection = None
+        self.output_names = output_names
+        self.display_name = display_name
+        self.screen_num = screen_num
+        self.target_crtcs = []
+
+    def __find_crtcs(self):
+        self.target_crtcs = []
+        not_found = self.output_names[:]
+        randr = self.randr
+        for crtc in randr.GetScreenResources(self.screen.root).reply().crtcs:
+            crtc_info = randr.GetCrtcInfo(crtc, int(time.time())).reply()
+            for output in crtc_info.outputs:
+                output_info = randr.GetOutputInfo(output, int(time.time())).reply()
+                name = bytes(output_info.name).decode('ascii')
+                if name in self.output_names:
+                    self.target_crtcs.append(crtc)
+                    not_found.remove(name)
+        for name in not_found:
+            print(f'Warning: output {name} not found!')
+
+    def connect(self):
+        def default_if_none(value, default):
+            if value is None:
+                return default
+            return value
+
+        if not self.connection:
+            disp_name = default_if_none(self.display_name, os.environ.get('DISPLAY'))
+            self.connection = con = xcffib.connect(disp_name)
+            screen_num = default_if_none(self.screen_num, con.pref_screen)
+            self.screen = con.get_setup().roots[screen_num]
+            self.randr = con(xcffib.randr.key)
+            self.__find_crtcs()
+
+        return self.randr
+
+    @lru_cache(maxsize=10)
+    def generate_gamma_table(self, size, brightness=1.0, gamma=1.0):
+        calc = lambda i: int(min(pow(i/(size - 1), gamma) * brightness, 1.0) * UINT16_MAX)
+        return list(calc(i) for i in range(size))
+
+    def set_brightness(self, brightness, gamma):
+        randr = self.connect()
+        for crtc in self.target_crtcs:
+            cur_gamma = randr.GetCrtcGamma(crtc).reply()
+            size = cur_gamma.size
+            adjusted = self.generate_gamma_table(size, brightness, gamma)
+            reply = randr.SetCrtcGamma(crtc, size, adjusted, adjusted, adjusted)
+        self.connection.flush()
+
+def translate_backlight(setter, backlight_path, gamma):
+    notify = inotify.adapters.Inotify()
+
+    notify.add_watch(str(backlight_path / 'actual_brightness'), inotify.constants.IN_MODIFY)
+
+    for event in notify.event_gen(yield_nones=False):
+        set_backlight(setter, backlight_path, gamma)
+
+def set_backlight(setter, backlight_path, gamma):
+        max_path = backlight_path / 'max_brightness'
+        actual_path = backlight_path / 'actual_brightness'
+
+        with open(str(max_path), 'rt') as max_file, open(str(actual_path), 'rt') as actual_file:
+            max_brightness = int(max_file.read())
+            actual_brightness = int(actual_file.read())
+
+        brightness = actual_brightness / max_brightness
+        setter.set_brightness(brightness, gamma=gamma)
+
+def main():
+
+    parser = configargparse.ArgParser(default_config_files=['/etc/default/oledbacklight'], formatter_class=configargparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-g', '--gamma', type=float, default=1.0)
+    parser.add_argument('-p', '--path', type=Path, default=DEFAULT_PATH, help=f'Path for the intel acpi backlight. For example "{DEFAULT_PATH}"')
+    parser.add_argument('-d', '--display', type=str, default=["eDP-1-1"], nargs='+', help="Displayss whose brightness to adjust with randr. Check \"xrandr -q\" for values. Normally it should be eDP1 or eDP-1")
+
+    parser.add_argument('-D', '--xrandr-display', type=str, default=XRANDR_DISPLAY, help="Display for xrandr, usually :0 or :1")
+    parser.add_argument('-X', '--xrandr-xauthority-path', type=str, default=XRANDR_XAUTHORITY_PATH, help="Path for xauthority file")
+
+    args = parser.parse_args()
+
+    os.putenv("DISPLAY", args.xrandr_display)
+    os.putenv("XAUTHORITY", args.xrandr_xauthority_path)
+
+    print(f'''Starting with config:
+gamma: {args.gamma}
+path: {args.path}
+display(s): {args.display}
+''')
+
+    setter = BrightnessSetter(args.display)
+    translate_backlight(setter, Path(args.path), args.gamma)
+
+    return 0
+
+if __name__ == '__main__':
+    import sys
+    sys.exit( main() )
